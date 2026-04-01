@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	"polymarket-terminal/internal/db"
 	"polymarket-terminal/internal/orderbook"
@@ -12,22 +13,22 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// ── External messages (sent from other goroutines via tea.Program.Send) ──────
-
-// BookUpdateMsg is sent by the reconciler whenever the orderbook changes.
 type BookUpdateMsg struct {
 	Bids []orderbook.Level
 	Asks []orderbook.Level
 	Hash string
 }
 
-// ConnectionMsg is sent by the WS client when connection state changes.
 type ConnectionMsg struct{ Connected bool }
 
-// SwitchingMsg clears the current book while a different market is loading.
 type SwitchingMsg struct{}
 
-// ── Styles ────────────────────────────────────────────────────────────────────
+type SyncStatusMsg struct {
+	Message string
+	Error   string
+	Source  string
+	Syncing bool
+}
 
 var (
 	liveStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("46")).Bold(true)
@@ -39,18 +40,20 @@ var (
 	dimStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 	selectedStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
 	helpStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
-	borderColor   = lipgloss.Color("237")
+	errorStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
 )
 
-const maxLevels = 12
+const (
+	maxLevels  = 12
+	staleAfter = 15 * time.Second
+)
 
-// ── Model ─────────────────────────────────────────────────────────────────────
-
-// Model is the bubbletea model for the terminal UI.
 type Model struct {
 	markets    []db.Market
 	marketIdx  int
 	switchIdx  int
+	filtered   []int
+	search     string
 	bids       []orderbook.Level
 	asks       []orderbook.Level
 	hash       string
@@ -58,17 +61,29 @@ type Model struct {
 	switching  bool
 	lastUpdate time.Time
 	switchMode bool
+	statusMsg  string
+	statusErr  string
+	statusSrc  string
 	width      int
 	height     int
 	onSwitch   func(assetID string)
+	onRefresh  func()
 }
 
-// New returns an initial Model. onSwitch is called when the user picks a market.
-func New(markets []db.Market, onSwitch func(assetID string)) Model {
-	return Model{
-		markets:  markets,
-		onSwitch: onSwitch,
+func New(markets []db.Market, activeAssetID string, onSwitch func(assetID string), onRefresh func()) Model {
+	m := Model{
+		markets:   markets,
+		onSwitch:  onSwitch,
+		onRefresh: onRefresh,
 	}
+	for i, market := range markets {
+		if market.AssetID == activeAssetID {
+			m.marketIdx = i
+			break
+		}
+	}
+	m.rebuildFilter()
+	return m
 }
 
 type tickMsg struct{}
@@ -90,6 +105,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.asks = msg.Asks
 		m.hash = msg.Hash
 		m.switching = false
+		m.statusErr = ""
 		m.lastUpdate = time.Now()
 	case SwitchingMsg:
 		m.bids = nil
@@ -99,6 +115,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastUpdate = time.Time{}
 	case ConnectionMsg:
 		m.connected = msg.Connected
+	case SyncStatusMsg:
+		m.statusMsg = msg.Message
+		m.statusErr = msg.Error
+		m.statusSrc = msg.Source
+		if msg.Syncing {
+			m.switching = true
+		} else if msg.Error != "" {
+			m.switching = false
+		}
 	}
 	return m, nil
 }
@@ -107,32 +132,48 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "q", "ctrl+c":
 		return m, tea.Quit
-
 	case "s":
 		if m.switchMode {
 			m.closeSwitcher()
 		} else {
 			m.openSwitcher()
 		}
-
+	case "r":
+		if !m.switchMode && m.onRefresh != nil {
+			return m, func() tea.Msg {
+				m.onRefresh()
+				return nil
+			}
+		}
 	case "esc":
 		if m.switchMode {
 			m.closeSwitcher()
 		}
-
 	case "up", "k":
 		if m.switchMode && m.switchIdx > 0 {
 			m.switchIdx--
 		}
-
 	case "down", "j":
-		if m.switchMode && m.switchIdx < len(m.markets)-1 {
+		if m.switchMode && m.switchIdx < len(m.filtered)-1 {
 			m.switchIdx++
 		}
-
 	case "enter":
 		if m.switchMode {
 			return m.commitSwitch()
+		}
+	case "backspace":
+		if m.switchMode && len(m.search) > 0 {
+			m.search = m.search[:len(m.search)-1]
+			m.rebuildFilter()
+		}
+	default:
+		if m.switchMode {
+			for _, r := range msg.Runes {
+				if isSearchRune(r) {
+					m.search += string(r)
+				}
+			}
+			m.rebuildFilter()
 		}
 	}
 	return m, nil
@@ -140,23 +181,30 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m *Model) openSwitcher() {
 	m.switchMode = true
-	m.switchIdx = m.marketIdx
+	m.search = ""
+	m.rebuildFilter()
+	m.switchIdx = m.filteredIndexForMarket(m.marketIdx)
 }
 
 func (m *Model) closeSwitcher() {
 	m.switchMode = false
-	m.switchIdx = m.marketIdx
+	m.search = ""
+	m.rebuildFilter()
+	m.switchIdx = m.filteredIndexForMarket(m.marketIdx)
 }
 
 func (m Model) commitSwitch() (tea.Model, tea.Cmd) {
 	m.switchMode = false
-	if m.switchIdx >= len(m.markets) {
+	if m.switchIdx >= len(m.filtered) {
 		return m, nil
 	}
-	if m.switchIdx == m.marketIdx {
+	targetIdx := m.filtered[m.switchIdx]
+	if targetIdx == m.marketIdx {
 		return m, nil
 	}
-	m.marketIdx = m.switchIdx
+	m.marketIdx = targetIdx
+	m.search = ""
+	m.rebuildFilter()
 	return m, m.switchCmd(m.markets[m.marketIdx].AssetID)
 }
 
@@ -170,11 +218,9 @@ func (m Model) switchCmd(assetID string) tea.Cmd {
 	}
 }
 
-// ── View ──────────────────────────────────────────────────────────────────────
-
 func (m Model) View() string {
 	if m.width == 0 {
-		return " loading…\n"
+		return " loading...\n"
 	}
 
 	var b strings.Builder
@@ -199,7 +245,14 @@ func (m Model) renderHeader() string {
 	if m.marketIdx < len(m.markets) {
 		label = m.markets[m.marketIdx].Label
 	}
-	title := fmt.Sprintf(" POLYMARKET  %s  %s", status, headerStyle.Render(label))
+
+	meta := ""
+	if len(m.bids) > 0 && len(m.asks) > 0 {
+		meta = dimStyle.Render(fmt.Sprintf("  bid %s  ask %s",
+			m.bids[0].Price.StringFixed(4),
+			m.asks[0].Price.StringFixed(4)))
+	}
+	title := fmt.Sprintf(" POLYMARKET  %s  %s%s", status, headerStyle.Render(label), meta)
 	bar := strings.Repeat("─", max(m.width-2, 10))
 	return title + "\n" + dimStyle.Render(" "+bar)
 }
@@ -211,7 +264,6 @@ func (m Model) renderBook() string {
 
 	var b strings.Builder
 
-	// Asks — display top N from high→low (reverse asks slice)
 	asks := m.asks
 	if len(asks) > maxLevels {
 		asks = asks[len(asks)-maxLevels:]
@@ -225,14 +277,12 @@ func (m Model) renderBook() string {
 			fmt.Sprintf("  %-*s  %s", priceW, l.Price.StringFixed(4), l.Size.StringFixed(2))) + "\n")
 	}
 
-	// Spread
 	spread := "–"
 	if len(m.bids) > 0 && len(m.asks) > 0 {
 		spread = m.asks[0].Price.Sub(m.bids[0].Price).StringFixed(4)
 	}
 	b.WriteString(spreadStyle.Render(fmt.Sprintf("  ── SPREAD %-*s ──", priceW-4, spread)) + "\n")
 
-	// Bids — top N high→low
 	bids := m.bids
 	if len(bids) > maxLevels {
 		bids = bids[:maxLevels]
@@ -245,13 +295,15 @@ func (m Model) renderBook() string {
 			fmt.Sprintf("  %-*s  %s", priceW, l.Price.StringFixed(4), l.Size.StringFixed(2))) + "\n")
 	}
 
-	// Status line
 	if m.switching {
-		b.WriteString(dimStyle.Render("\n  syncing book…") + "\n")
+		b.WriteString(dimStyle.Render("\n  syncing book...") + "\n")
 	} else if !m.lastUpdate.IsZero() {
 		age := time.Since(m.lastUpdate)
-		b.WriteString(dimStyle.Render(
-			fmt.Sprintf("\n  hash: %s…  updated: %.1fs ago", shortHash(m.hash), age.Seconds())) + "\n")
+		line := fmt.Sprintf("\n  hash: %s...  updated: %.1fs ago", shortHash(m.hash), age.Seconds())
+		if age > staleAfter {
+			line += "  feed stale"
+		}
+		b.WriteString(dimStyle.Render(line) + "\n")
 	}
 
 	return b.String()
@@ -259,11 +311,16 @@ func (m Model) renderBook() string {
 
 func (m Model) renderSwitcher() string {
 	var b strings.Builder
-	b.WriteString(dimStyle.Render("  ── Markets (↑/↓ to navigate, enter to confirm) ──") + "\n")
-	for i, mkt := range m.markets {
+	header := "  ── Markets (type to filter, ↑/↓ to navigate, enter to confirm) ──"
+	if m.search != "" {
+		header += "  search: " + m.search
+	}
+	b.WriteString(dimStyle.Render(header) + "\n")
+	for i, idx := range m.filtered {
+		mkt := m.markets[idx]
 		shortID := mkt.AssetID
 		if len(shortID) > 10 {
-			shortID = shortID[:10] + "…"
+			shortID = shortID[:10] + "..."
 		}
 		line := fmt.Sprintf("  %s  %s", mkt.Label, dimStyle.Render("("+shortID+")"))
 		if i == m.switchIdx {
@@ -276,11 +333,44 @@ func (m Model) renderSwitcher() string {
 }
 
 func (m Model) renderHelp() string {
-	parts := []string{"[s] switch", "[↑/↓] navigate", "[esc] cancel", "[q] quit"}
+	parts := []string{"[s] switch", "[r] resync", "[↑/↓] navigate", "[esc] cancel", "[q] quit"}
+	if m.statusErr != "" {
+		parts = append(parts, errorStyle.Render(m.statusErr))
+	} else if m.statusMsg != "" {
+		parts = append(parts, m.statusMsg)
+	}
 	return helpStyle.Render(" "+strings.Join(parts, "  ")) + "\n"
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────────
+func (m *Model) rebuildFilter() {
+	m.filtered = m.filtered[:0]
+	needle := strings.ToLower(strings.TrimSpace(m.search))
+	for i, market := range m.markets {
+		if needle == "" ||
+			strings.Contains(strings.ToLower(market.Label), needle) ||
+			strings.Contains(strings.ToLower(market.AssetID), needle) {
+			m.filtered = append(m.filtered, i)
+		}
+	}
+	if len(m.filtered) == 0 && len(m.markets) > 0 {
+		m.filtered = append(m.filtered, m.marketIdx)
+	}
+	if m.switchIdx >= len(m.filtered) {
+		m.switchIdx = len(m.filtered) - 1
+	}
+	if m.switchIdx < 0 {
+		m.switchIdx = 0
+	}
+}
+
+func (m Model) filteredIndexForMarket(marketIdx int) int {
+	for i, idx := range m.filtered {
+		if idx == marketIdx {
+			return i
+		}
+	}
+	return 0
+}
 
 func shortHash(h string) string {
 	if len(h) > 8 {
@@ -294,4 +384,8 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func isSearchRune(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsDigit(r) || unicode.IsSpace(r) || r == '-' || r == '_'
 }

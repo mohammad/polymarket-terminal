@@ -2,76 +2,105 @@ package reconciler
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"time"
 
-	"polymarket-terminal/internal/db"
 	"polymarket-terminal/internal/orderbook"
-	"polymarket-terminal/internal/rest"
 	"polymarket-terminal/internal/ws"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/shopspring/decimal"
 )
 
-// UpdateFn is called after every book mutation with a consistent snapshot.
-// It runs in the reconciler goroutine, so implementations must be non-blocking
-// (e.g. send to a buffered channel, call tea.Program.Send).
-type UpdateFn func(bids, asks []orderbook.Level, hash string)
+type restFetcher interface {
+	FetchBook(ctx context.Context, assetID string) (bids, asks []orderbook.Level, hash string, err error)
+}
+
+type snapshotStore interface {
+	LoadSnapshot(ctx context.Context, assetID string) (bids, asks []orderbook.Level, hash string, err error)
+	SaveSnapshot(ctx context.Context, assetID string, bids, asks []orderbook.Level, hash string) error
+}
+
+// UpdateFn is called after the active book mutates with a consistent snapshot.
+type UpdateFn func(assetID string, bids, asks []orderbook.Level, hash string)
+
+// StatusFn reports the active market's sync lifecycle to the UI/logging layer.
+type StatusFn func(Status)
+
+type Status struct {
+	AssetID   string
+	Syncing   bool
+	Error     string
+	Message   string
+	Source    string
+	UpdatedAt time.Time
+}
 
 // Config holds tunable parameters for the Reconciler.
 type Config struct {
-	SyncInterval  time.Duration // how often to diff against the REST snapshot
-	WriteInterval time.Duration // how often to persist the book to Postgres
-	OnUpdate      UpdateFn      // called on every book change; may be nil
+	ActiveAssetID string
+	AssetIDs      []string
+	SyncInterval  time.Duration
+	WriteInterval time.Duration
+	OnUpdate      UpdateFn
+	OnStatus      StatusFn
 }
 
-// Reconciler owns the write path for a single orderbook.
-// It seeds from the DB on cold start, syncs from the REST API on connect and
-// periodically, applies streaming WS deltas, and writes snapshots to the DB.
-//
-// Market switching is handled via SwitchMarket; the caller creates a new Book
-// and hands it to the reconciler, which then re-seeds and re-syncs.
+// Reconciler owns the write path for all subscribed books while exposing one
+// active market to the UI. Hidden markets stay warm from the shared WS feed so
+// switching is usually instant.
 type Reconciler struct {
-	book          *orderbook.Book
-	wsClient      *ws.Client
-	restClient    *rest.Client
-	store         *db.Store
+	books         map[string]*orderbook.Book
+	activeAssetID string
+	events        <-chan ws.Event
+	restClient    restFetcher
+	store         snapshotStore
 	syncInterval  time.Duration
 	writeInterval time.Duration
 	onUpdate      UpdateFn
-	switchCh      chan *orderbook.Book
+	onStatus      StatusFn
+	switchCh      chan string
+	resyncCh      chan struct{}
+	dirty         map[string]struct{}
 }
 
 func New(
-	book *orderbook.Book,
-	wsClient *ws.Client,
-	restClient *rest.Client,
-	store *db.Store,
+	events <-chan ws.Event,
+	restClient restFetcher,
+	store snapshotStore,
 	cfg Config,
 ) *Reconciler {
+	books := make(map[string]*orderbook.Book, len(cfg.AssetIDs))
+	for _, assetID := range cfg.AssetIDs {
+		books[assetID] = orderbook.New(assetID)
+	}
+	if cfg.ActiveAssetID != "" && books[cfg.ActiveAssetID] == nil {
+		books[cfg.ActiveAssetID] = orderbook.New(cfg.ActiveAssetID)
+	}
+
 	return &Reconciler{
-		book:          book,
-		wsClient:      wsClient,
+		books:         books,
+		activeAssetID: cfg.ActiveAssetID,
+		events:        events,
 		restClient:    restClient,
 		store:         store,
 		syncInterval:  cfg.SyncInterval,
 		writeInterval: cfg.WriteInterval,
 		onUpdate:      cfg.OnUpdate,
-		switchCh:      make(chan *orderbook.Book, 1),
+		onStatus:      cfg.OnStatus,
+		switchCh:      make(chan string, 1),
+		resyncCh:      make(chan struct{}, 1),
+		dirty:         make(map[string]struct{}),
 	}
 }
 
-// SwitchMarket replaces the active book and triggers an immediate resync.
-// Non-blocking: if a switch is already pending, it is replaced with the newer one.
-// Safe to call from any goroutine, including the TUI event loop.
-func (r *Reconciler) SwitchMarket(book *orderbook.Book) {
+func (r *Reconciler) SwitchMarket(assetID string) {
 	for {
 		select {
-		case r.switchCh <- book:
+		case r.switchCh <- assetID:
 			return
 		default:
-			// Drain the stale pending switch and retry.
 			select {
 			case <-r.switchCh:
 			default:
@@ -80,9 +109,16 @@ func (r *Reconciler) SwitchMarket(book *orderbook.Book) {
 	}
 }
 
+func (r *Reconciler) ForceResync() {
+	select {
+	case r.resyncCh <- struct{}{}:
+	default:
+	}
+}
+
 // Run is the main reconciliation loop. Blocks until ctx is done.
 func (r *Reconciler) Run(ctx context.Context) {
-	r.coldStart(ctx)
+	r.coldStart(ctx, r.activeAssetID, true)
 
 	syncTicker := time.NewTicker(r.syncInterval)
 	writeTicker := time.NewTicker(r.writeInterval)
@@ -94,13 +130,27 @@ func (r *Reconciler) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 
-		case newBook := <-r.switchCh:
-			r.book = newBook
-			slog.Info("switched market", "asset", r.book.AssetID())
-			r.coldStart(ctx)
+		case assetID := <-r.switchCh:
+			if assetID == "" {
+				continue
+			}
+			r.activeAssetID = assetID
+			slog.Info("market switched", "asset", assetID)
+			r.notifyStatus(Status{
+				AssetID:   assetID,
+				Syncing:   true,
+				Message:   "switching market",
+				Source:    "switch",
+				UpdatedAt: time.Now(),
+			})
+			r.notifyActive()
+			r.coldStart(ctx, assetID, false)
 
-		case e := <-r.wsClient.Events:
+		case e := <-r.events:
 			r.handleEvent(e)
+
+		case <-r.resyncCh:
+			r.resync(ctx, r.activeAssetID, "manual")
 
 		case <-syncTicker.C:
 			r.periodicSync(ctx)
@@ -111,94 +161,178 @@ func (r *Reconciler) Run(ctx context.Context) {
 	}
 }
 
-// coldStart seeds from the DB snapshot (instant data on restart) then fetches
-// an authoritative REST snapshot to overwrite any stale DB state.
-func (r *Reconciler) coldStart(ctx context.Context) {
-	if bids, asks, hash, err := r.store.LoadSnapshot(ctx, r.book.AssetID()); err == nil {
-		r.book.ApplySnapshot(bids, asks, hash)
-		r.notify()
-		slog.Info("seeded from db", "asset", r.book.AssetID(), "hash", shortHash(hash))
-	} else if err != pgx.ErrNoRows {
-		slog.Warn("db snapshot load error", "asset", r.book.AssetID(), "err", err)
+func (r *Reconciler) coldStart(ctx context.Context, assetID string, forceDB bool) {
+	book := r.bookFor(assetID)
+	if forceDB || book.Hash() == "" {
+		if bids, asks, hash, err := r.store.LoadSnapshot(ctx, assetID); err == nil {
+			book.ApplySnapshot(bids, asks, hash)
+			r.markDirty(assetID)
+			if assetID == r.activeAssetID {
+				r.notifyActive()
+			}
+			slog.Info("seeded from db", "asset", assetID, "hash", shortHash(hash))
+		} else if err != pgx.ErrNoRows {
+			slog.Warn("db snapshot load failed", "asset", assetID, "err", err)
+		}
 	}
 
-	r.resync(ctx)
+	r.resync(ctx, assetID, "startup")
 }
 
 func (r *Reconciler) handleEvent(e ws.Event) {
 	switch e.EventType {
 	case "book":
-		if e.AssetID != r.book.AssetID() {
+		book := r.lookupBook(e.AssetID)
+		if book == nil {
 			return
 		}
 		bids := parseLevels(e.Bids)
 		asks := parseLevels(e.Asks)
-		r.book.ApplySnapshot(bids, asks, e.Hash)
-		r.notify()
+		book.ApplySnapshot(bids, asks, e.Hash)
+		r.markDirty(e.AssetID)
+		if e.AssetID == r.activeAssetID {
+			r.notifyActive()
+		}
 
 	case "price_change":
-		updated := false
+		updatedAssets := make(map[string]struct{})
 		for _, ch := range e.Changes {
-			if ch.AssetID != r.book.AssetID() {
+			book := r.lookupBook(ch.AssetID)
+			if book == nil {
 				continue
 			}
 			price, _ := decimal.NewFromString(ch.Price)
 			size, _ := decimal.NewFromString(ch.Size)
-			r.book.ApplyDelta(ch.Side, price, size, ch.Hash)
-			updated = true
+			book.ApplyDelta(ch.Side, price, size, ch.Hash)
+			r.markDirty(ch.AssetID)
+			updatedAssets[ch.AssetID] = struct{}{}
 		}
-		if updated {
-			r.notify()
+		if _, ok := updatedAssets[r.activeAssetID]; ok {
+			r.notifyActive()
 		}
 	}
 }
 
-// periodicSync fetches the REST snapshot and reconciles if the hash drifted.
 func (r *Reconciler) periodicSync(ctx context.Context) {
-	bids, asks, hash, err := r.restClient.FetchBook(ctx, r.book.AssetID())
-	if err != nil {
-		slog.Warn("periodic sync failed", "asset", r.book.AssetID(), "err", err)
-		return
-	}
-	if hash == r.book.Hash() {
-		return // in sync
-	}
-	slog.Info("hash drift detected — resyncing",
-		"asset", r.book.AssetID(),
-		"local", shortHash(r.book.Hash()),
-		"remote", shortHash(hash))
-	r.book.ApplySnapshot(bids, asks, hash)
-	r.notify()
+	r.resync(ctx, r.activeAssetID, "periodic")
 }
 
-// resync always fetches and applies the REST snapshot regardless of hash.
-func (r *Reconciler) resync(ctx context.Context) {
-	bids, asks, hash, err := r.restClient.FetchBook(ctx, r.book.AssetID())
-	if err != nil {
-		slog.Warn("resync failed", "asset", r.book.AssetID(), "err", err)
+func (r *Reconciler) resync(ctx context.Context, assetID, source string) {
+	if assetID == "" {
 		return
 	}
-	r.book.ApplySnapshot(bids, asks, hash)
-	r.notify()
-	slog.Info("resynced from REST", "asset", r.book.AssetID(), "hash", shortHash(hash))
+	r.notifyStatus(Status{
+		AssetID:   assetID,
+		Syncing:   true,
+		Message:   "refreshing orderbook",
+		Source:    source,
+		UpdatedAt: time.Now(),
+	})
+
+	book := r.bookFor(assetID)
+	localHash := book.Hash()
+	bids, asks, hash, err := r.restClient.FetchBook(ctx, assetID)
+	if err != nil {
+		msg := fmt.Sprintf("%s sync failed: %v", source, err)
+		slog.Warn("rest sync failed", "asset", assetID, "source", source, "err", err)
+		if assetID == r.activeAssetID {
+			r.notifyStatus(Status{
+				AssetID:   assetID,
+				Syncing:   false,
+				Error:     msg,
+				Message:   msg,
+				Source:    source,
+				UpdatedAt: time.Now(),
+			})
+		}
+		return
+	}
+	if hash == localHash && source == "periodic" {
+		if assetID == r.activeAssetID {
+			r.notifyStatus(Status{
+				AssetID:   assetID,
+				Syncing:   false,
+				Message:   "book in sync",
+				Source:    source,
+				UpdatedAt: time.Now(),
+			})
+		}
+		return
+	}
+
+	if source == "periodic" && localHash != "" && localHash != hash {
+		slog.Info("hash drift detected",
+			"asset", assetID,
+			"local", shortHash(localHash),
+			"remote", shortHash(hash))
+	}
+
+	book.ApplySnapshot(bids, asks, hash)
+	r.markDirty(assetID)
+	if assetID == r.activeAssetID {
+		r.notifyActive()
+		r.notifyStatus(Status{
+			AssetID:   assetID,
+			Syncing:   false,
+			Message:   "orderbook synced",
+			Source:    source,
+			UpdatedAt: time.Now(),
+		})
+	}
+	slog.Info("resynced from REST", "asset", assetID, "source", source, "hash", shortHash(hash))
 }
 
 func (r *Reconciler) persist(ctx context.Context) {
-	bids, asks, hash := r.book.Snapshot()
-	if hash == "" {
-		return // nothing to persist yet
-	}
-	if err := r.store.SaveSnapshot(ctx, r.book.AssetID(), bids, asks, hash); err != nil {
-		slog.Warn("db persist failed", "asset", r.book.AssetID(), "err", err)
+	for assetID := range r.dirty {
+		book := r.bookFor(assetID)
+		bids, asks, hash := book.Snapshot()
+		if hash == "" {
+			delete(r.dirty, assetID)
+			continue
+		}
+		if err := r.store.SaveSnapshot(ctx, assetID, bids, asks, hash); err != nil {
+			slog.Warn("db persist failed", "asset", assetID, "err", err)
+			continue
+		}
+		delete(r.dirty, assetID)
 	}
 }
 
-func (r *Reconciler) notify() {
-	if r.onUpdate == nil {
+func (r *Reconciler) notifyActive() {
+	if r.onUpdate == nil || r.activeAssetID == "" {
 		return
 	}
-	bids, asks, hash := r.book.Snapshot()
-	r.onUpdate(bids, asks, hash)
+	bids, asks, hash := r.bookFor(r.activeAssetID).Snapshot()
+	r.onUpdate(r.activeAssetID, bids, asks, hash)
+}
+
+func (r *Reconciler) notifyStatus(status Status) {
+	if r.onStatus == nil {
+		return
+	}
+	r.onStatus(status)
+}
+
+func (r *Reconciler) lookupBook(assetID string) *orderbook.Book {
+	if assetID == "" {
+		return nil
+	}
+	return r.books[assetID]
+}
+
+func (r *Reconciler) bookFor(assetID string) *orderbook.Book {
+	if book := r.lookupBook(assetID); book != nil {
+		return book
+	}
+	book := orderbook.New(assetID)
+	r.books[assetID] = book
+	return book
+}
+
+func (r *Reconciler) markDirty(assetID string) {
+	if assetID != "" {
+		r.dirty[assetID] = struct{}{}
+	}
 }
 
 func parseLevels(levels []ws.PriceLevel) []orderbook.Level {

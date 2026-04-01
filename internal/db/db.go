@@ -66,6 +66,26 @@ func (s *Store) AddMarket(ctx context.Context, assetID, label string) error {
 	return err
 }
 
+func (s *Store) LoadLastViewedMarket(ctx context.Context) (string, error) {
+	var assetID string
+	err := s.pool.QueryRow(ctx,
+		`SELECT value FROM app_state WHERE key = 'last_viewed_market'`).Scan(&assetID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", err
+	}
+	return assetID, err
+}
+
+func (s *Store) SaveLastViewedMarket(ctx context.Context, assetID string) error {
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO app_state (key, value, updated_at)
+		 VALUES ('last_viewed_market', $1, $2)
+		 ON CONFLICT (key) DO UPDATE
+		   SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
+		assetID, time.Now())
+	return err
+}
+
 // SaveSnapshot upserts the current orderbook state for an asset.
 func (s *Store) SaveSnapshot(ctx context.Context, assetID string, bids, asks []orderbook.Level, hash string) error {
 	bj, err := marshalLevels(bids)

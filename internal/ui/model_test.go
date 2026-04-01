@@ -16,9 +16,9 @@ func TestSwitcherMovesCursorWithoutSwitchingUntilEnter(t *testing.T) {
 		{AssetID: "a1", Label: "Market 1"},
 		{AssetID: "a2", Label: "Market 2"},
 		{AssetID: "a3", Label: "Market 3"},
-	}, func(assetID string) {
+	}, "a1", func(assetID string) {
 		switchedTo = assetID
-	})
+	}, nil)
 
 	next, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
 	m := next.(Model)
@@ -62,7 +62,7 @@ func TestEscapeCancelsPendingSelection(t *testing.T) {
 	model := New([]db.Market{
 		{AssetID: "a1", Label: "Market 1"},
 		{AssetID: "a2", Label: "Market 2"},
-	}, nil)
+	}, "a1", nil, nil)
 
 	next, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
 	m := next.(Model)
@@ -83,7 +83,7 @@ func TestEscapeCancelsPendingSelection(t *testing.T) {
 }
 
 func TestSwitchingMsgClearsStaleBookState(t *testing.T) {
-	model := New([]db.Market{{AssetID: "a1", Label: "Market 1"}}, nil)
+	model := New([]db.Market{{AssetID: "a1", Label: "Market 1"}}, "a1", nil, nil)
 	model.bids = []orderbook.Level{{}}
 	model.asks = []orderbook.Level{{}}
 	model.hash = "hash-1"
@@ -103,5 +103,41 @@ func TestSwitchingMsgClearsStaleBookState(t *testing.T) {
 	}
 	if !m.lastUpdate.IsZero() {
 		t.Fatalf("last update should be reset while switching")
+	}
+}
+
+func TestSwitcherSearchFiltersMarkets(t *testing.T) {
+	model := New([]db.Market{
+		{AssetID: "a1", Label: "Alpha"},
+		{AssetID: "a2", Label: "Beta"},
+		{AssetID: "a3", Label: "Gamma"},
+	}, "a1", nil, nil)
+
+	next, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m := next.(Model)
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	m = next.(Model)
+
+	if len(m.filtered) != 1 {
+		t.Fatalf("filtered markets = %d, want 1", len(m.filtered))
+	}
+	if m.markets[m.filtered[0]].Label != "Gamma" {
+		t.Fatalf("filtered market = %q, want Gamma", m.markets[m.filtered[0]].Label)
+	}
+}
+
+func TestRefreshKeyRunsRefreshCommand(t *testing.T) {
+	called := false
+	model := New([]db.Market{{AssetID: "a1", Label: "Alpha"}}, "a1", nil, func() {
+		called = true
+	})
+
+	_, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	if cmd == nil {
+		t.Fatalf("expected refresh command")
+	}
+	_ = cmd()
+	if !called {
+		t.Fatalf("refresh callback was not called")
 	}
 }
