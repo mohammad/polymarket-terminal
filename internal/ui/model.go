@@ -24,6 +24,9 @@ type BookUpdateMsg struct {
 // ConnectionMsg is sent by the WS client when connection state changes.
 type ConnectionMsg struct{ Connected bool }
 
+// SwitchingMsg clears the current book while a different market is loading.
+type SwitchingMsg struct{}
+
 // ── Styles ────────────────────────────────────────────────────────────────────
 
 var (
@@ -45,17 +48,19 @@ const maxLevels = 12
 
 // Model is the bubbletea model for the terminal UI.
 type Model struct {
-	markets     []db.Market
-	marketIdx   int
-	bids        []orderbook.Level
-	asks        []orderbook.Level
-	hash        string
-	connected   bool
-	lastUpdate  time.Time
-	switchMode  bool
-	width       int
-	height      int
-	onSwitch    func(assetID string)
+	markets    []db.Market
+	marketIdx  int
+	switchIdx  int
+	bids       []orderbook.Level
+	asks       []orderbook.Level
+	hash       string
+	connected  bool
+	switching  bool
+	lastUpdate time.Time
+	switchMode bool
+	width      int
+	height     int
+	onSwitch   func(assetID string)
 }
 
 // New returns an initial Model. onSwitch is called when the user picks a market.
@@ -84,7 +89,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.bids = msg.Bids
 		m.asks = msg.Asks
 		m.hash = msg.Hash
+		m.switching = false
 		m.lastUpdate = time.Now()
+	case SwitchingMsg:
+		m.bids = nil
+		m.asks = nil
+		m.hash = ""
+		m.switching = true
+		m.lastUpdate = time.Time{}
 	case ConnectionMsg:
 		m.connected = msg.Connected
 	}
@@ -97,34 +109,64 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 
 	case "s":
-		m.switchMode = !m.switchMode
+		if m.switchMode {
+			m.closeSwitcher()
+		} else {
+			m.openSwitcher()
+		}
 
 	case "esc":
-		m.switchMode = false
+		if m.switchMode {
+			m.closeSwitcher()
+		}
 
 	case "up", "k":
-		if m.switchMode && m.marketIdx > 0 {
-			m.marketIdx--
-			m.doSwitch()
+		if m.switchMode && m.switchIdx > 0 {
+			m.switchIdx--
 		}
 
 	case "down", "j":
-		if m.switchMode && m.marketIdx < len(m.markets)-1 {
-			m.marketIdx++
-			m.doSwitch()
+		if m.switchMode && m.switchIdx < len(m.markets)-1 {
+			m.switchIdx++
 		}
 
 	case "enter":
 		if m.switchMode {
-			m.switchMode = false
+			return m.commitSwitch()
 		}
 	}
 	return m, nil
 }
 
-func (m Model) doSwitch() {
-	if m.onSwitch != nil && m.marketIdx < len(m.markets) {
-		m.onSwitch(m.markets[m.marketIdx].AssetID)
+func (m *Model) openSwitcher() {
+	m.switchMode = true
+	m.switchIdx = m.marketIdx
+}
+
+func (m *Model) closeSwitcher() {
+	m.switchMode = false
+	m.switchIdx = m.marketIdx
+}
+
+func (m Model) commitSwitch() (tea.Model, tea.Cmd) {
+	m.switchMode = false
+	if m.switchIdx >= len(m.markets) {
+		return m, nil
+	}
+	if m.switchIdx == m.marketIdx {
+		return m, nil
+	}
+	m.marketIdx = m.switchIdx
+	return m, m.switchCmd(m.markets[m.marketIdx].AssetID)
+}
+
+func (m Model) switchCmd(assetID string) tea.Cmd {
+	if m.onSwitch == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		m.onSwitch(assetID)
+		return nil
 	}
 }
 
@@ -204,7 +246,9 @@ func (m Model) renderBook() string {
 	}
 
 	// Status line
-	if !m.lastUpdate.IsZero() {
+	if m.switching {
+		b.WriteString(dimStyle.Render("\n  syncing book…") + "\n")
+	} else if !m.lastUpdate.IsZero() {
 		age := time.Since(m.lastUpdate)
 		b.WriteString(dimStyle.Render(
 			fmt.Sprintf("\n  hash: %s…  updated: %.1fs ago", shortHash(m.hash), age.Seconds())) + "\n")
@@ -222,7 +266,7 @@ func (m Model) renderSwitcher() string {
 			shortID = shortID[:10] + "…"
 		}
 		line := fmt.Sprintf("  %s  %s", mkt.Label, dimStyle.Render("("+shortID+")"))
-		if i == m.marketIdx {
+		if i == m.switchIdx {
 			b.WriteString(selectedStyle.Render("▶"+line) + "\n")
 		} else {
 			b.WriteString(dimStyle.Render(" "+line) + "\n")

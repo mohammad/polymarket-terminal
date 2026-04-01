@@ -63,8 +63,8 @@ func main() {
 	// rec and prog are set before the TUI event loop starts, so this is safe.
 	switchFn := func(assetID string) {
 		newBook := orderbook.New(assetID)
-		rec.SwitchMarket(newBook)     // reconciler picks it up immediately
-		prog.Send(ui.BookUpdateMsg{}) // clear stale display while resyncing
+		rec.SwitchMarket(newBook)    // reconciler picks it up immediately
+		prog.Send(ui.SwitchingMsg{}) // clear stale display while resyncing
 	}
 
 	uiModel := ui.New(markets, switchFn)

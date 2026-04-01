@@ -63,9 +63,21 @@ func New(
 }
 
 // SwitchMarket replaces the active book and triggers an immediate resync.
-// Safe to call from any goroutine.
+// Non-blocking: if a switch is already pending, it is replaced with the newer one.
+// Safe to call from any goroutine, including the TUI event loop.
 func (r *Reconciler) SwitchMarket(book *orderbook.Book) {
-	r.switchCh <- book
+	for {
+		select {
+		case r.switchCh <- book:
+			return
+		default:
+			// Drain the stale pending switch and retry.
+			select {
+			case <-r.switchCh:
+			default:
+			}
+		}
+	}
 }
 
 // Run is the main reconciliation loop. Blocks until ctx is done.

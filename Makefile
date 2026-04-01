@@ -13,6 +13,10 @@ reset:
 	docker compose down -v
 	docker compose up -d --wait
 
+# Cleans the binary
+clean:
+	rm -rf bin
+
 ## Build the binary
 build:
 	go build -o bin/polymarket-terminal ./cmd

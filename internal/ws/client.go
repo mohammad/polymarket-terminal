@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"github.com/gorilla/websocket"
 )
@@ -15,6 +15,7 @@ import (
 const (
 	writeTimeout  = 10 * time.Second
 	pongWait      = 60 * time.Second
+	pingInterval  = 10 * time.Second
 	reconnectBase = 1 * time.Second
 	reconnectMax  = 30 * time.Second
 )
@@ -22,19 +23,20 @@ const (
 // Client maintains a persistent WebSocket connection to the Polymarket CLOB feed.
 // It exposes a buffered Events channel; consumers should drain it continuously.
 type Client struct {
-	url      string
-	markets  atomic.Pointer[[]string] // safe for concurrent UpdateMarkets calls
-	Events   chan Event
+	url       string
+	markets   atomic.Pointer[[]string] // safe for concurrent UpdateMarkets calls
+	writeMu   sync.Mutex
+	Events    chan Event
 	Connected chan bool // signals connection state changes (non-blocking send)
 }
 
 func NewClient(url string, markets []string) *Client {
 	c := &Client{
+		url:       url,
 		Events:    make(chan Event, 512),
 		Connected: make(chan bool, 8),
 	}
 	c.markets.Store(&markets)
-	_ = unsafe.Sizeof(c) // suppress unused import lint
 	return c
 }
 
@@ -88,11 +90,13 @@ func (c *Client) connect(ctx context.Context) error {
 	}
 	c.signal(true)
 
-	// The server sends pings to us; our handler resets the deadline and replies
-	// with a pong. This is the only writer, so there are no concurrent write races.
+	// The server can ping us at any time; reply with a pong and extend the read
+	// deadline. All writes share writeMu because the client also sends heartbeats.
 	conn.SetReadDeadline(time.Now().Add(pongWait))
 	conn.SetPingHandler(func(appData string) error {
 		conn.SetReadDeadline(time.Now().Add(pongWait))
+		c.writeMu.Lock()
+		defer c.writeMu.Unlock()
 		conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 		return conn.WriteMessage(websocket.PongMessage, []byte(appData))
 	})
@@ -109,10 +113,17 @@ func (c *Client) connect(ctx context.Context) error {
 		}
 	}()
 
+	pingTicker := time.NewTicker(pingInterval)
+	defer pingTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-pingTicker.C:
+			if err := c.writeJSON(conn, map[string]any{}); err != nil {
+				return fmt.Errorf("heartbeat: %w", err)
+			}
 		case err := <-readErr:
 			return err
 		}
@@ -146,6 +157,8 @@ func (c *Client) signal(connected bool) {
 }
 
 func (c *Client) writeJSON(conn *websocket.Conn, v any) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 	return conn.WriteJSON(v)
 }
