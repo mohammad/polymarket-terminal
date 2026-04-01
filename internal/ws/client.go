@@ -15,7 +15,6 @@ import (
 const (
 	writeTimeout  = 10 * time.Second
 	pongWait      = 60 * time.Second
-	pingPeriod    = 30 * time.Second
 	reconnectBase = 1 * time.Second
 	reconnectMax  = 30 * time.Second
 )
@@ -81,23 +80,22 @@ func (c *Client) connect(ctx context.Context) error {
 
 	markets := *c.markets.Load()
 	sub := SubscribeMsg{
-		Auth:    nil,
-		Markets: markets,
-		Type:    "market",
+		AssetIDs: markets,
+		Type:     "market",
 	}
 	if err := c.writeJSON(conn, sub); err != nil {
 		return fmt.Errorf("subscribe: %w", err)
 	}
 	c.signal(true)
 
+	// The server sends pings to us; our handler resets the deadline and replies
+	// with a pong. This is the only writer, so there are no concurrent write races.
 	conn.SetReadDeadline(time.Now().Add(pongWait))
-	conn.SetPongHandler(func(string) error {
+	conn.SetPingHandler(func(appData string) error {
 		conn.SetReadDeadline(time.Now().Add(pongWait))
-		return nil
+		conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+		return conn.WriteMessage(websocket.PongMessage, []byte(appData))
 	})
-
-	pingTicker := time.NewTicker(pingPeriod)
-	defer pingTicker.Stop()
 
 	readErr := make(chan error, 1)
 	go func() {
@@ -117,11 +115,6 @@ func (c *Client) connect(ctx context.Context) error {
 			return nil
 		case err := <-readErr:
 			return err
-		case <-pingTicker.C:
-			conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				return err
-			}
 		}
 	}
 }

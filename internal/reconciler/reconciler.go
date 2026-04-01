@@ -114,24 +114,30 @@ func (r *Reconciler) coldStart(ctx context.Context) {
 }
 
 func (r *Reconciler) handleEvent(e ws.Event) {
-	if e.AssetID != r.book.AssetID() {
-		return
-	}
-
 	switch e.EventType {
 	case "book":
+		if e.AssetID != r.book.AssetID() {
+			return
+		}
 		bids := parseLevels(e.Bids)
 		asks := parseLevels(e.Asks)
 		r.book.ApplySnapshot(bids, asks, e.Hash)
 		r.notify()
 
 	case "price_change":
+		updated := false
 		for _, ch := range e.Changes {
+			if ch.AssetID != r.book.AssetID() {
+				continue
+			}
 			price, _ := decimal.NewFromString(ch.Price)
 			size, _ := decimal.NewFromString(ch.Size)
-			r.book.ApplyDelta(ch.Side, price, size, e.Hash)
+			r.book.ApplyDelta(ch.Side, price, size, ch.Hash)
+			updated = true
 		}
-		r.notify()
+		if updated {
+			r.notify()
+		}
 	}
 }
 

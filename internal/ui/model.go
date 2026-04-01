@@ -66,10 +66,16 @@ func New(markets []db.Market, onSwitch func(assetID string)) Model {
 	}
 }
 
-func (m Model) Init() tea.Cmd { return nil }
+type tickMsg struct{}
+
+func (m Model) Init() tea.Cmd {
+	return tea.Tick(time.Second, func(time.Time) tea.Msg { return tickMsg{} })
+}
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tickMsg:
+		return m, tea.Tick(time.Second, func(time.Time) tea.Msg { return tickMsg{} })
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	case tea.WindowSizeMsg:
